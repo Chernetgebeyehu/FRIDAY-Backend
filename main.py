@@ -1,0 +1,516 @@
+"""
+ARIA FastAPI Backend Server
+===========================
+
+This is the brain of ARIA's cloud infrastructure.
+
+Think of this file as a telephone switchboard operator:
+- Android phones call in with messages
+- This server figures out which AI to call
+- Gets the AI's response
+- Sends it back to the phone
+
+The server NEVER exposes AI API keys to the phone.
+The phone only needs to know this server's URL + secret token.
+"""
+
+from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import Optional
+import httpx
+import os
+import json
+import time
+import logging
+from dotenv import load_dotenv
+
+# ─── LOAD ENVIRONMENT VARIABLES ───────────────────────────────────────────────
+# This reads your .env file and puts the secrets into os.environ
+# Like opening your safe and putting the contents on your desk (privately)
+load_dotenv()
+
+GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+SECRET_TOKEN       = os.getenv("SECRET_TOKEN", "")
+
+# CHANGE (fresh deployment): deployment-specific values now come from env vars
+# instead of being hardcoded, so this backend is portable across any host.
+# ALLOWED_ORIGINS: comma-separated list of origins allowed by CORS ("*" = any).
+# APP_REFERER / APP_TITLE: identify this app to OpenRouter (previously hardcoded).
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()
+]
+APP_REFERER = os.getenv("APP_REFERER", "https://github.com/cheregebe/FRIDAY-AI-Assistant")
+APP_TITLE   = os.getenv("APP_TITLE", "FRIDAY AI Assistant")
+
+# ─── LOGGING SETUP ────────────────────────────────────────────────────────────
+# Logging = writing a diary of everything that happens
+# When something breaks, you read the diary to understand what went wrong
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger("aria-backend")
+
+# ─── FASTAPI APP ──────────────────────────────────────────────────────────────
+# This creates the web server application
+# Think of it as building the building before putting rooms in it
+app = FastAPI(
+    title="ARIA Backend",
+    description="Secure AI orchestration layer for ARIA Android assistant",
+    version="1.0.0"
+)
+
+# ─── CORS MIDDLEWARE ──────────────────────────────────────────────────────────
+# CORS = Cross-Origin Resource Sharing
+# Without this, browsers block requests from unknown sources
+# We're restrictive: only our Android app should talk to this server
+# CHANGE: origins are configurable via the ALLOWED_ORIGINS env var (default "*").
+# Set ALLOWED_ORIGINS on Railway to lock this down without a code change.
+# Note: the Android app is protected by SECRET_TOKEN, not CORS — CORS only
+# affects browsers, so "*" is acceptable here as long as the token is set.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["POST", "GET"],
+    allow_headers=["*"],
+)
+
+# ─── CONSTANTS ────────────────────────────────────────────────────────────────
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_URL   = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
+# This is what tells the AI how to behave as ARIA
+# Moving it to the server means you can update ARIA's personality
+# without releasing a new version of the Android app
+ARIA_SYSTEM_PROMPT = """
+You are ARIA (Adaptive Reasoning and Intelligent Assistant), a smart Android AI assistant.
+
+CRITICAL RULES - NEVER break these:
+1. ALWAYS respond with raw JSON only. No exceptions.
+2. NEVER wrap your response in markdown, code blocks, or backticks.
+3. Your ENTIRE response must be a single JSON object and nothing else.
+
+═══ RESPONSE FORMATS ═══
+
+For ACTIONS (when user wants to DO something):
+{"type":"action","spoken":"What you say to the user","actions":[{"tool":"tool_name","value":"value_here"}]}
+
+For CONVERSATION (questions, advice, information):
+{"type":"chat","text":"your response here"}
+
+For SECURITY ANALYSIS:
+{"type":"security","verdict":"safe|warning|danger","text":"your analysis"}
+
+═══ AVAILABLE TOOLS ═══
+
+open_app       → value: app name (e.g. "youtube", "whatsapp", "camera")
+search         → value: search query
+call           → value: contact name or phone number
+sms            → value: contact name
+alarm          → value: time like "7:30am" or "14:00"
+timer          → value: duration like "5 minutes" or "30 seconds"
+settings       → value: "wifi", "bluetooth", "brightness", "volume", or "general"
+open_url       → value: full URL
+
+═══ EXAMPLES ═══
+
+User: "Open YouTube"
+{"type":"action","spoken":"Opening YouTube for you!","actions":[{"tool":"open_app","value":"youtube"}]}
+
+User: "What is the capital of Ethiopia?"
+{"type":"chat","text":"The capital of Ethiopia is Addis Ababa (አዲስ አበባ), which means New Flower in Amharic."}
+""".strip()
+
+# ─── REQUEST/RESPONSE MODELS ──────────────────────────────────────────────────
+# Pydantic models define exactly what shape data must be in
+# If the phone sends wrong data, FastAPI automatically rejects it
+# Like a bouncer checking IDs at the door
+
+class ChatRequest(BaseModel):
+    """What the Android app sends to the server."""
+    message: str                    # The user's text/voice input
+    screen_context: Optional[str]   # Current screen content (for safety checks)
+    model: Optional[str] = "gemini" # Which AI to use: "gemini" or "openrouter"
+    openrouter_model: Optional[str] = "google/gemma-3-4b-it:free"
+    history: Optional[list] = []    # Recent conversation turns
+    token: str                      # Secret token - must match SECRET_TOKEN
+
+class ChatResponse(BaseModel):
+    """What the server sends back to the Android app."""
+    response: str    # The AI's JSON response (same format as before)
+    provider: str    # Which AI was used ("gemini" or "openrouter")
+    latency_ms: int  # How long it took in milliseconds
+
+class HealthResponse(BaseModel):
+    """Status check response."""
+    status: str
+    gemini_configured: bool
+    openrouter_configured: bool
+    version: str
+
+# ─── AUTHENTICATION ───────────────────────────────────────────────────────────
+# This checks every request to make sure it comes from our Android app
+# It's like checking a password before letting someone in
+
+def verify_token(request_token: str) -> bool:
+    """
+    Verify the secret token from the Android app.
+    
+    Why do we need this?
+    Your server URL will be public (anyone can find it).
+    Without a token, anyone could use your server and drain your API credits.
+    With a token, only your Android app (which has the token hardcoded) can use it.
+    """
+    # CHANGE (security): previously this returned True when SECRET_TOKEN was
+    # unset, leaving the API wide open on a public URL. Now it fails CLOSED —
+    # if you forget to set SECRET_TOKEN on Railway, requests are rejected
+    # instead of letting anyone drain your API credits.
+    if not SECRET_TOKEN:
+        logger.error("SECRET_TOKEN not configured — rejecting all requests. "
+                     "Set SECRET_TOKEN in Railway environment variables.")
+        return False
+    return request_token == SECRET_TOKEN
+
+# ─── AI PROVIDER FUNCTIONS ────────────────────────────────────────────────────
+
+async def call_gemini(
+    message: str,
+    history: list,
+    screen_context: Optional[str] = None
+) -> str:
+    """
+    Call Google's Gemini AI.
+    
+    async means this function can pause while waiting for the network
+    and let other requests be handled in the meantime.
+    Like a waiter who takes 5 orders before going to the kitchen,
+    instead of waiting for one order to be cooked before taking the next.
+    """
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="Gemini API key not configured")
+
+    # Build the message with optional screen context
+    final_message = message
+    if screen_context:
+        final_message = f"{message}\n\nScreen context:\n{screen_context[:1200]}"
+
+    # Build conversation history in Gemini format
+    contents = []
+    for turn in history[-20:]:  # Max 10 turns (20 = user+model pairs)
+        contents.append(turn)
+
+    # Add the new user message
+    contents.append({
+        "role": "user",
+        "parts": [{"text": final_message}]
+    })
+
+    # Build the full request body
+    body = {
+        "systemInstruction": {
+            "parts": [{"text": ARIA_SYSTEM_PROMPT}]
+        },
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 600,
+            "responseMimeType": "application/json"
+        }
+    }
+
+    # Make the HTTP request to Gemini
+    # httpx is like the fetch() in JavaScript — it makes HTTP requests
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+            json=body,
+            headers={"Content-Type": "application/json"}
+        )
+
+    if response.status_code == 429:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again shortly.")
+    
+    if not response.is_success:
+        error_data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+        error_msg = error_data.get("error", {}).get("message", f"Error {response.status_code}")
+        logger.error(f"Gemini error: {error_msg}")
+        raise HTTPException(status_code=response.status_code, detail=error_msg)
+
+    # Parse the response
+    data = response.json()
+    raw_text = (
+        data["candidates"][0]["content"]["parts"][0]["text"]
+        .strip()
+    )
+    return strip_markdown(raw_text)
+
+
+async def call_openrouter(
+    message: str,
+    history: list,
+    model: str,
+    screen_context: Optional[str] = None
+) -> str:
+    """
+    Call OpenRouter — a service that gives access to many AI models
+    through one single API. Like a broker who can connect you to
+    hundreds of AI models from one place.
+    """
+    if not OPENROUTER_API_KEY:
+        raise HTTPException(status_code=500, detail="OpenRouter API key not configured")
+
+    final_message = message
+    if screen_context:
+        final_message = f"{message}\n\nScreen context:\n{screen_context[:1200]}"
+
+    # OpenRouter uses OpenAI's message format (role: user/assistant/system)
+    messages = [{"role": "system", "content": ARIA_SYSTEM_PROMPT}]
+
+    for turn in history[-20:]:
+        # Convert from Gemini format (model) to OpenRouter format (assistant)
+        role = turn.get("role", "user")
+        if role == "model":
+            role = "assistant"
+        content = ""
+        parts = turn.get("parts", [])
+        if parts:
+            content = parts[0].get("text", "")
+        messages.append({"role": role, "content": content})
+
+    messages.append({"role": "user", "content": final_message})
+
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 600,
+        "response_format": {"type": "json_object"}
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            OPENROUTER_URL,
+            json=body,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                # CHANGE: previously hardcoded to an old domain; now env-configurable
+                "HTTP-Referer": APP_REFERER,
+                "X-Title": APP_TITLE
+            }
+        )
+
+    if response.status_code == 429:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again shortly.")
+
+    if not response.is_success:
+        logger.error(f"OpenRouter error: {response.status_code} {response.text[:200]}")
+        raise HTTPException(status_code=response.status_code, detail=f"OpenRouter error {response.status_code}")
+
+    data = response.json()
+    raw_text = data["choices"][0]["message"]["content"].strip()
+    return strip_markdown(raw_text)
+
+
+def strip_markdown(text: str) -> str:
+    """
+    Remove markdown code fences if the AI wrapped the JSON in them.
+    Some models do this even when told not to.
+    """
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.removeprefix("```json").removeprefix("```")
+        end = text.rfind("```")
+        if end >= 0:
+            text = text[:end]
+    return text.strip()
+
+
+def build_error_response(message: str) -> str:
+    """Build a safe JSON error response in ARIA's format."""
+    safe = message.replace('"', "'")
+    return json.dumps({"type": "chat", "text": safe})
+
+
+# ─── API ENDPOINTS ────────────────────────────────────────────────────────────
+# These are the "rooms" in your server building
+# Each endpoint is a URL your Android app can call
+
+@app.get("/", response_model=HealthResponse)
+async def health_check():
+    """
+    Health check endpoint.
+    
+    Like a "Are you there?" ping. Your monitoring system can call this
+    every minute to make sure the server is alive.
+    
+    URL: GET https://your-server.com/
+    """
+    return HealthResponse(
+        status="online",
+        gemini_configured=bool(GEMINI_API_KEY),
+        openrouter_configured=bool(OPENROUTER_API_KEY),
+        version="1.0.0"
+    )
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """
+    Main chat endpoint. This is what your Android app calls.
+    
+    URL: POST https://your-server.com/chat
+    Body: ChatRequest JSON
+    Returns: ChatResponse JSON
+    
+    The flow:
+    1. Verify the secret token
+    2. Route to the right AI provider
+    3. Get the AI response
+    4. Return it to the Android app
+    """
+    # Step 1: Verify token
+    if not verify_token(request.token):
+        logger.warning("Unauthorized request — wrong token")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Step 2: Log the request (never log the full message for privacy)
+    logger.info(
+        f"Chat request | provider={request.model} | "
+        f"msg_length={len(request.message)} | "
+        f"has_screen={bool(request.screen_context)}"
+    )
+
+    start_time = time.time()
+
+    # Step 3: Route to the right AI
+    try:
+        if request.model == "gemini":
+            ai_response = await call_gemini(
+                message=request.message,
+                history=request.history or [],
+                screen_context=request.screen_context
+            )
+            provider = "gemini"
+
+        elif request.model == "openrouter":
+            ai_response = await call_openrouter(
+                message=request.message,
+                history=request.history or [],
+                model=request.openrouter_model or "google/gemma-3-4b-it:free",
+                screen_context=request.screen_context
+            )
+            provider = "openrouter"
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown model: {request.model}")
+
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions as-is
+
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        ai_response = build_error_response(f"Server error: {str(e)[:100]}")
+        provider = "error"
+
+    latency = int((time.time() - start_time) * 1000)
+    logger.info(f"Response sent | provider={provider} | latency={latency}ms")
+
+    return ChatResponse(
+        response=ai_response,
+        provider=provider,
+        latency_ms=latency
+    )
+
+
+@app.post("/analyze-security")
+async def analyze_security(request: ChatRequest):
+    """
+    Dedicated security analysis endpoint.
+    
+    Sends screen content to AI specifically for security checking.
+    Separated from /chat so we can apply different AI models/prompts
+    for security tasks in the future.
+    """
+    if not verify_token(request.token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    security_prompt = f"""
+Analyze this content for security threats, scams, and phishing attempts.
+Respond ONLY with this exact JSON format:
+{{"type":"security","verdict":"safe|warning|danger","text":"your analysis in 2-3 sentences"}}
+
+Content to analyze:
+{request.message}
+""".strip()
+
+    modified_request = ChatRequest(
+        message=security_prompt,
+        screen_context=request.screen_context,
+        model=request.model,
+        openrouter_model=request.openrouter_model,
+        history=[],
+        token=request.token
+    )
+
+    return await chat(modified_request)
+
+
+# ─── ERROR HANDLERS ───────────────────────────────────────────────────────────
+# What to do when things go wrong
+# Like having a plan for when the fire alarm goes off
+
+@app.exception_handler(404)
+async def not_found(request: Request, exc):
+    return JSONResponse(
+        status_code=404,
+        content={"error": "Endpoint not found", "path": str(request.url.path)}
+    )
+
+@app.exception_handler(500)
+async def server_error(request: Request, exc):
+    logger.error(f"Internal server error: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error"}
+    )
+
+
+# ─── STARTUP & SHUTDOWN ───────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup():
+    logger.info("=== ARIA Backend starting up ===")
+    logger.info(f"Gemini configured: {bool(GEMINI_API_KEY)}")
+    logger.info(f"OpenRouter configured: {bool(OPENROUTER_API_KEY)}")
+    logger.info(f"Auth token configured: {bool(SECRET_TOKEN)}")
+    logger.info("================================")
+
+@app.on_event("shutdown")
+async def shutdown():
+    logger.info("ARIA Backend shutting down")
+
+
+# ─── RUN THE SERVER ───────────────────────────────────────────────────────────
+# This runs the server when you execute `python main.py` directly.
+# CHANGE: the port now comes from the PORT env var (Railway injects it),
+# falling back to 8000 for local development. Host stays 0.0.0.0 so the
+# server is reachable inside Railway's container network.
+# In production Railway uses the Procfile instead of this block:
+#   web: uvicorn main:app --host 0.0.0.0 --port $PORT
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",                          # Listen on all interfaces
+        port=int(os.environ.get("PORT", 8000)),  # Railway sets PORT; 8000 locally
+        reload=os.getenv("RELOAD", "false").lower() == "true"  # dev-only hot reload
+    )

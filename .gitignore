@@ -1,0 +1,15 @@
+# Secrets — never commit environment files
+.env
+
+# Virtual environments
+venv/
+.venv/
+
+# Python caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Local vector database (memory system) — deployment-specific data, not code
+aria_memory_db/
