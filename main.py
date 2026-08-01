@@ -45,6 +45,14 @@ ALLOWED_ORIGINS = [
 APP_REFERER = os.getenv("APP_REFERER", "https://github.com/cheregebe/FRIDAY-AI-Assistant")
 APP_TITLE   = os.getenv("APP_TITLE", "FRIDAY AI Assistant")
 
+# CHANGE (production upgrade): single source of truth for the app version.
+# Set APP_VERSION on Railway to change the reported version without a deploy.
+APP_VERSION  = os.getenv("APP_VERSION", "1.0.0")
+SERVICE_NAME = "FRIDAY Backend"
+
+# Uptime tracking — monotonic clock so clock adjustments never skew uptime.
+_START_MONOTONIC = time.monotonic()
+
 # ─── LOGGING SETUP ────────────────────────────────────────────────────────────
 # Logging = writing a diary of everything that happens
 # When something breaks, you read the diary to understand what went wrong
@@ -54,13 +62,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("aria-backend")
 
+# CHANGE (security fix found during audit): httpx logs every request URL at
+# INFO level, and the Gemini URL contains "?key=<GEMINI_API_KEY>" — which would
+# write the real API key into Railway's production logs. Raise httpx to WARNING
+# so request URLs (and the key) are never logged.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # ─── FASTAPI APP ──────────────────────────────────────────────────────────────
 # This creates the web server application
 # Think of it as building the building before putting rooms in it
 app = FastAPI(
     title="ARIA Backend",
     description="Secure AI orchestration layer for ARIA Android assistant",
-    version="1.0.0"
+    version=APP_VERSION
 )
 
 # ─── CORS MIDDLEWARE ──────────────────────────────────────────────────────────
@@ -142,6 +156,12 @@ class ChatRequest(BaseModel):
     openrouter_model: Optional[str] = "google/gemma-3-4b-it:free"
     history: Optional[list] = []    # Recent conversation turns
     token: str                      # Secret token - must match SECRET_TOKEN
+    # Sent by the Android app; accepted for forward-compatibility.
+    # user_id/store_memory are reserved for the deferred memory system (memory.py),
+    # use_agent for future agent routing. Currently accepted but not acted upon.
+    user_id: Optional[str] = None
+    store_memory: Optional[bool] = False
+    use_agent: Optional[bool] = False
 
 class ChatResponse(BaseModel):
     """What the server sends back to the Android app."""
@@ -340,6 +360,28 @@ def build_error_response(message: str) -> str:
     return json.dumps({"type": "chat", "text": safe})
 
 
+def get_uptime_seconds() -> float:
+    """Elapsed seconds since process start, from a monotonic clock."""
+    return time.monotonic() - _START_MONOTONIC
+
+
+def format_uptime(seconds: float) -> str:
+    """Human-readable uptime like '1d 2h 3m 4s'."""
+    seconds = int(seconds)
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or parts:
+        parts.append(f"{hours}h")
+    if minutes or parts:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
 # ─── API ENDPOINTS ────────────────────────────────────────────────────────────
 # These are the "rooms" in your server building
 # Each endpoint is a URL your Android app can call
@@ -358,8 +400,64 @@ async def health_check():
         status="online",
         gemini_configured=bool(GEMINI_API_KEY),
         openrouter_configured=bool(OPENROUTER_API_KEY),
-        version="1.0.0"
+        version=APP_VERSION
     )
+
+
+# ─── PRODUCTION DIAGNOSTIC ENDPOINTS ─────────────────────────────────────────
+# Lightweight monitoring endpoints. None of these require authentication, call
+# an AI provider, or reveal secrets — they only report configuration *status*.
+
+@app.get("/ping")
+async def ping():
+    """
+    Minimal connectivity test.
+
+    No auth, no AI calls, no dependencies — just proof the server is reachable.
+    Use this for the Android app's connection test and uptime monitors.
+    """
+    return {"status": "ok"}
+
+
+@app.get("/health")
+async def health():
+    """
+    Detailed backend health report (no secrets).
+
+    Reports service identity, uptime, and which providers are configured.
+    Keys themselves are never returned — only "configured"/"not_configured".
+    """
+    return {
+        "status": "online",
+        "service": SERVICE_NAME,
+        "version": APP_VERSION,
+        "uptime_seconds": round(get_uptime_seconds(), 1),
+        "uptime_human": format_uptime(get_uptime_seconds()),
+        "providers": {
+            "gemini": "configured" if GEMINI_API_KEY else "not_configured",
+            "openrouter": "configured" if OPENROUTER_API_KEY else "not_configured",
+        },
+        "auth": "configured" if SECRET_TOKEN else "not_configured",
+        # Railway sets RAILWAY_ENVIRONMENT (e.g. "production"); safe to expose.
+        "environment": os.getenv("RAILWAY_ENVIRONMENT", "local"),
+    }
+
+
+@app.get("/version")
+async def version():
+    """Backend version. Single source: APP_VERSION env var (default 1.0.0)."""
+    return {"name": SERVICE_NAME, "version": APP_VERSION}
+
+
+@app.get("/providers")
+async def providers():
+    """
+    Which AI providers are configured (booleans only — never the keys).
+    """
+    return {
+        "gemini": bool(GEMINI_API_KEY),
+        "openrouter": bool(OPENROUTER_API_KEY),
+    }
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -483,16 +581,68 @@ async def server_error(request: Request, exc):
         content={"error": "Internal server error"}
     )
 
+# CHANGE (production upgrade): catch-all for *unhandled* exceptions. The 500
+# handler above only fires for explicit HTTP 500s; this one catches anything
+# that would otherwise leak a stack trace to the client. Full traceback is
+# logged server-side; the client only ever sees a clean JSON body.
+@app.exception_handler(Exception)
+async def unhandled_exception(request: Request, exc: Exception):
+    logger.error(
+        f"Unhandled exception on {request.method} {request.url.path}: {exc}",
+        exc_info=True
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error"}
+    )
+
 
 # ─── STARTUP & SHUTDOWN ───────────────────────────────────────────────────────
 
+def validate_configuration():
+    """
+    Validate environment configuration at startup and log clear warnings.
+
+    Nothing here is fatal — the server always starts so Railway health checks
+    pass, and the existing behavior handles the rest:
+    - Missing SECRET_TOKEN  → auth fails CLOSED (verify_token rejects everything)
+    - Missing provider keys → that provider returns a clean 500 when requested
+    """
+    problems = []
+    if not SECRET_TOKEN:
+        problems.append(
+            "SECRET_TOKEN is not set — ALL /chat requests will be rejected (fail-closed). "
+            "Set it in Railway's Variables tab."
+        )
+    if not GEMINI_API_KEY and not OPENROUTER_API_KEY:
+        problems.append(
+            "No AI provider configured (GEMINI_API_KEY and OPENROUTER_API_KEY both missing) — "
+            "/chat will return errors for every request."
+        )
+    elif not GEMINI_API_KEY:
+        problems.append("GEMINI_API_KEY not set — gemini requests will fail.")
+    elif not OPENROUTER_API_KEY:
+        problems.append("OPENROUTER_API_KEY not set — openrouter requests will fail.")
+
+    for p in problems:
+        logger.warning(f"CONFIG: {p}")
+    return problems
+
+
 @app.on_event("startup")
 async def startup():
-    logger.info("=== ARIA Backend starting up ===")
+    logger.info("=" * 60)
+    logger.info(f"{SERVICE_NAME} started")
+    logger.info(f"Version: {APP_VERSION}")
+    logger.info(f"Host: 0.0.0.0 | PORT: {os.getenv('PORT', '8000')}")
+    logger.info(f"Environment: {os.getenv('RAILWAY_ENVIRONMENT', 'local')}")
+    # Booleans only — never log key material or token values.
     logger.info(f"Gemini configured: {bool(GEMINI_API_KEY)}")
     logger.info(f"OpenRouter configured: {bool(OPENROUTER_API_KEY)}")
-    logger.info(f"Auth token configured: {bool(SECRET_TOKEN)}")
-    logger.info("================================")
+    logger.info(f"Authentication configured: {bool(SECRET_TOKEN)}")
+    validate_configuration()
+    logger.info(f"Startup complete in {get_uptime_seconds():.2f}s")
+    logger.info("=" * 60)
 
 @app.on_event("shutdown")
 async def shutdown():

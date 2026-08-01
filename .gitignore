@@ -13,3 +13,6 @@ __pycache__/
 
 # Local vector database (memory system) — deployment-specific data, not code
 aria_memory_db/
+
+# Local backups made before big edits — never commit these
+*.backup-*
