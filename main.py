@@ -1,8 +1,8 @@
 """
-ARIA FastAPI Backend Server
-===========================
+FRIDAY FastAPI Backend Server
+=============================
 
-This is the brain of ARIA's cloud infrastructure.
+This is the brain of FRIDAY's cloud infrastructure.
 
 Think of this file as a telephone switchboard operator:
 - Android phones call in with messages
@@ -82,7 +82,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
-logger = logging.getLogger("aria-backend")
+logger = logging.getLogger("friday-backend")
 
 # CHANGE (security fix found during audit): httpx logs every request URL at
 # INFO level, and the Gemini URL contains "?key=<GEMINI_API_KEY>" — which would
@@ -94,8 +94,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # This creates the web server application
 # Think of it as building the building before putting rooms in it
 app = FastAPI(
-    title="ARIA Backend",
-    description="Secure AI orchestration layer for ARIA Android assistant",
+    title="FRIDAY Backend",
+    description="Secure AI orchestration layer for the FRIDAY Android assistant",
     version=APP_VERSION
 )
 
@@ -124,11 +124,13 @@ GEMINI_URL = (
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
-# This is what tells the AI how to behave as ARIA
-# Moving it to the server means you can update ARIA's personality
+# This is what tells the AI how to behave as FRIDAY
+# Moving it to the server means you can update FRIDAY's personality
 # without releasing a new version of the Android app
-ARIA_SYSTEM_PROMPT = """
-You are ARIA (Adaptive Reasoning and Intelligent Assistant), a smart Android AI assistant.
+# IDENTITY: the assistant is FRIDAY — never ARIA, and never expanded into an
+# acronym. If you change the name here, the whole product changes personality.
+FRIDAY_SYSTEM_PROMPT = """
+You are FRIDAY, a smart Android AI assistant.
 
 CRITICAL RULES - NEVER break these:
 1. ALWAYS respond with raw JSON only. No exceptions.
@@ -310,7 +312,7 @@ async def call_gemini(
     # Build the full request body
     body = {
         "systemInstruction": {
-            "parts": [{"text": ARIA_SYSTEM_PROMPT}]
+            "parts": [{"text": FRIDAY_SYSTEM_PROMPT}]
         },
         "contents": contents,
         "generationConfig": {
@@ -364,7 +366,7 @@ async def call_openrouter(
         final_message = f"{message}\n\nScreen context:\n{screen_context[:1200]}"
 
     # OpenRouter uses OpenAI's message format (role: user/assistant/system)
-    messages = [{"role": "system", "content": ARIA_SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": FRIDAY_SYSTEM_PROMPT}]
 
     for turn in history[-20:]:
         # Convert from Gemini format (model) to OpenRouter format (assistant)
@@ -427,7 +429,7 @@ def strip_markdown(text: str) -> str:
 
 
 def build_error_response(message: str) -> str:
-    """Build a safe JSON error response in ARIA's format."""
+    """Build a safe JSON error response in FRIDAY's chat format."""
     safe = message.replace('"', "'")
     return json.dumps({"type": "chat", "text": safe})
 
@@ -730,7 +732,7 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    logger.info("ARIA Backend shutting down")
+    logger.info("FRIDAY Backend shutting down")
 
 
 # ─── RUN THE SERVER ───────────────────────────────────────────────────────────

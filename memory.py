@@ -1,8 +1,8 @@
 """
-ARIA Memory System
-==================
+FRIDAY Memory System
+====================
 
-This is ARIA's long-term memory.
+This is FRIDAY's long-term memory.
 
 Think of it like a very smart notebook:
 - Every important thing the user says gets written down
@@ -32,7 +32,7 @@ from typing import Optional
 from sentence_transformers import SentenceTransformer
 from datetime import datetime, timedelta
 
-logger = logging.getLogger("aria-memory")
+logger = logging.getLogger("friday-memory")
 
 # ─── CONFIGURATION ────────────────────────────────────────────────────────────
 
@@ -40,6 +40,8 @@ logger = logging.getLogger("aria-memory")
 # This means memories persist even after the server restarts
 # CHANGE (portability): configurable via CHROMA_PATH env var so it can point
 # at a Railway Volume mount in production; defaults to a local folder for dev.
+# COMPAT: the default path keeps the legacy "aria_" prefix so existing local
+# databases keep working — it's a disk path, never shown to users or the AI.
 CHROMA_PATH = os.getenv("CHROMA_PATH", "./aria_memory_db")
 
 # The embedding model we use to convert text → numbers
@@ -71,11 +73,11 @@ class MemoryType:
     GENERAL    = "general"     # Anything else
 
 
-# ─── ARIA MEMORY MANAGER ──────────────────────────────────────────────────────
+# ─── FRIDAY MEMORY MANAGER ──────────────────────────────────────────────────────
 
-class AriaMemoryManager:
+class FridayMemoryManager:
     """
-    The main memory system for ARIA.
+    The main memory system for FRIDAY.
     
     This class handles:
     1. Storing new memories (with embeddings)
@@ -85,7 +87,7 @@ class AriaMemoryManager:
     """
 
     def __init__(self):
-        logger.info("Initializing ARIA Memory Manager...")
+        logger.info("Initializing FRIDAY Memory Manager...")
 
         # Initialize ChromaDB — the vector database
         # PersistentClient means data is saved to disk between restarts
@@ -99,6 +101,10 @@ class AriaMemoryManager:
         # Two identical vectors → similarity = 1.0
         # Two completely different vectors → similarity ≈ 0.0
         self.collection = self.chroma_client.get_or_create_collection(
+            # COMPAT: collection name intentionally keeps the legacy "aria_"
+            # prefix — renaming it would orphan every memory already stored
+            # on disk. It is a storage key, not an identity string; the AI
+            # never sees it.
             name="aria_memories",
             metadata={"hnsw:space": "cosine"}
         )
@@ -136,7 +142,7 @@ class AriaMemoryManager:
         metadata: Optional[dict] = None
     ) -> str:
         """
-        Save a piece of information to ARIA's long-term memory.
+        Save a piece of information to FRIDAY's long-term memory.
         
         Args:
             user_id: Who this memory belongs to (e.g., "user_123")
@@ -359,7 +365,7 @@ class AriaMemoryManager:
         
         Example output:
         
-        ARIA's Memory (what I know about you):
+        FRIDAY's Memory (what I know about you):
         [fact] You live in Addis Ababa. (remembered 3 days ago)
         [preference] You prefer concise responses. (remembered 1 week ago)
         [skill] You know Python programming. (remembered yesterday)
@@ -367,7 +373,7 @@ class AriaMemoryManager:
         if not memories:
             return ""
 
-        lines = ["ARIA's Memory (what I know about you):"]
+        lines = ["FRIDAY's Memory (what I know about you):"]
         for mem in memories:
             mem_type = mem.get("type", "general")
             content = mem.get("content", "")
@@ -511,14 +517,14 @@ class MemoryExtractor:
 # We create one instance shared across all requests
 # Like having one filing cabinet for the whole office
 
-_memory_manager: Optional[AriaMemoryManager] = None
+_memory_manager: Optional[FridayMemoryManager] = None
 _memory_extractor = MemoryExtractor()
 
-def get_memory_manager() -> AriaMemoryManager:
+def get_memory_manager() -> FridayMemoryManager:
     """Get the shared memory manager instance."""
     global _memory_manager
     if _memory_manager is None:
-        _memory_manager = AriaMemoryManager()
+        _memory_manager = FridayMemoryManager()
     return _memory_manager
 
 def get_memory_extractor() -> MemoryExtractor:
