@@ -50,6 +50,28 @@ APP_TITLE   = os.getenv("APP_TITLE", "FRIDAY AI Assistant")
 APP_VERSION  = os.getenv("APP_VERSION", "1.0.0")
 SERVICE_NAME = "FRIDAY Backend"
 
+# ─── AI MODEL SELECTION (env-driven — NEVER hardcode model IDs) ───────────────
+# WHY models must never be hardcoded:
+# AI providers retire and delist models on their own schedule. A hardcoded ID
+# rots silently: the day the provider drops it, every /chat request starts
+# failing with an upstream 404 — which (before this change) was proxied through
+# FastAPI's app-level 404 handler and reached the Android app as
+# {"error":"Endpoint not found","path":"/chat"}, indistinguishable from a
+# missing route. That exact incident happened with the previously pinned
+# "gemini-2.5-flash" (retired by Google) and "google/gemma-3-4b-it:free"
+# (delisted by OpenRouter). Env-driven models mean a rot fix is a Railway
+# Variables edit + restart — no code change, no redeploy of the Android app.
+#
+# GEMINI_MODEL: Gemini model code. Fallback is the "-latest" rolling alias,
+# which Google keeps pointed at the current flash model precisely so servers
+# never pin a snapshot that can retire.
+# DEFAULT_OPENROUTER_MODEL: used when the Android app doesn't specify one.
+# Fallback verified live in OpenRouter's catalog (2026-08-01).
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+DEFAULT_OPENROUTER_MODEL = os.getenv(
+    "DEFAULT_OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it:free"
+)
+
 # Uptime tracking — monotonic clock so clock adjustments never skew uptime.
 _START_MONOTONIC = time.monotonic()
 
@@ -93,8 +115,9 @@ app.add_middleware(
 )
 
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_URL   = (
+# GEMINI_MODEL / DEFAULT_OPENROUTER_MODEL are env-driven (see AI MODEL
+# SELECTION above) — only the provider base URLs are true constants.
+GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent"
 )
@@ -153,7 +176,9 @@ class ChatRequest(BaseModel):
     message: str                    # The user's text/voice input
     screen_context: Optional[str]   # Current screen content (for safety checks)
     model: Optional[str] = "gemini" # Which AI to use: "gemini" or "openrouter"
-    openrouter_model: Optional[str] = "google/gemma-3-4b-it:free"
+    # None → server picks DEFAULT_OPENROUTER_MODEL (env-driven). Never hardcode
+    # a model ID here: providers delist models and a baked-in default rots.
+    openrouter_model: Optional[str] = None
     history: Optional[list] = []    # Recent conversation turns
     token: str                      # Secret token - must match SECRET_TOKEN
     # Sent by the Android app; accepted for forward-compatibility.
@@ -200,6 +225,55 @@ def verify_token(request_token: str) -> bool:
     return request_token == SECRET_TOKEN
 
 # ─── AI PROVIDER FUNCTIONS ────────────────────────────────────────────────────
+
+def raise_provider_error(provider: str, upstream_status: int, message: str):
+    """
+    Translate an upstream AI-provider HTTP status into the status WE return.
+
+    WHY we never propagate provider status codes directly:
+    Upstream codes describe the relationship between THIS SERVER and the
+    provider, not between the Android app and this server. Propagating them
+    verbatim caused a production incident: OpenRouter/Google returned 404 for
+    a delisted model, the 404 fell into FastAPI's app-level 404 handler, and
+    the Android app was told {"error":"Endpoint not found","path":"/chat"} —
+    a model-rot problem disguised as a missing route.
+
+    Translation table:
+      429        → 429  (rate limiting is genuinely about request volume —
+                         the app has a friendly retry message for it)
+      500+       → 503  (provider outage: service temporarily unavailable —
+                         the app retries, then falls back to its offline engine)
+      everything
+      else (4xx) → 502  (Bad Gateway: the provider rejected OUR upstream
+                         request — bad model ID (404), bad server-side key
+                         (401), malformed request (400). All of these are
+                         server-configuration problems, never the app's fault)
+
+    The body is structured JSON (FastAPI wraps it as {"detail": {...}}) so
+    logs and clients can see exactly which provider failed and why, without
+    ambiguity about whose status code they're looking at.
+    """
+    if upstream_status == 429:
+        ours = 429
+    elif upstream_status >= 500:
+        ours = 503
+    else:
+        ours = 502
+
+    logger.error(
+        f"Provider error | provider={provider} | "
+        f"upstream_status={upstream_status} | returned={ours} | {message[:200]}"
+    )
+    raise HTTPException(
+        status_code=ours,
+        detail={
+            "error": "upstream_provider_error",
+            "provider": provider,
+            "provider_status": upstream_status,
+            "message": message[:300],
+        },
+    )
+
 
 async def call_gemini(
     message: str,
@@ -255,14 +329,12 @@ async def call_gemini(
             headers={"Content-Type": "application/json"}
         )
 
-    if response.status_code == 429:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again shortly.")
-    
     if not response.is_success:
+        # NEVER re-raise the upstream status verbatim — translate it
+        # (see raise_provider_error for the incident this prevents).
         error_data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
         error_msg = error_data.get("error", {}).get("message", f"Error {response.status_code}")
-        logger.error(f"Gemini error: {error_msg}")
-        raise HTTPException(status_code=response.status_code, detail=error_msg)
+        raise_provider_error("gemini", response.status_code, error_msg)
 
     # Parse the response
     data = response.json()
@@ -328,12 +400,12 @@ async def call_openrouter(
             }
         )
 
-    if response.status_code == 429:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again shortly.")
-
     if not response.is_success:
-        logger.error(f"OpenRouter error: {response.status_code} {response.text[:200]}")
-        raise HTTPException(status_code=response.status_code, detail=f"OpenRouter error {response.status_code}")
+        # NEVER re-raise the upstream status verbatim — translate it
+        # (see raise_provider_error for the incident this prevents).
+        raise_provider_error(
+            "openrouter", response.status_code, response.text[:200]
+        )
 
     data = response.json()
     raw_text = data["choices"][0]["message"]["content"].strip()
@@ -503,7 +575,7 @@ async def chat(request: ChatRequest):
             ai_response = await call_openrouter(
                 message=request.message,
                 history=request.history or [],
-                model=request.openrouter_model or "google/gemma-3-4b-it:free",
+                model=request.openrouter_model or DEFAULT_OPENROUTER_MODEL,
                 screen_context=request.screen_context
             )
             provider = "openrouter"
@@ -636,9 +708,21 @@ async def startup():
     logger.info(f"Version: {APP_VERSION}")
     logger.info(f"Host: 0.0.0.0 | PORT: {os.getenv('PORT', '8000')}")
     logger.info(f"Environment: {os.getenv('RAILWAY_ENVIRONMENT', 'local')}")
-    # Booleans only — never log key material or token values.
-    logger.info(f"Gemini configured: {bool(GEMINI_API_KEY)}")
-    logger.info(f"OpenRouter configured: {bool(OPENROUTER_API_KEY)}")
+    # Model selection is env-driven; log what was actually resolved so a bad
+    # Railway variable is visible in the deploy logs immediately.
+    logger.info(
+        f"Gemini model: {GEMINI_MODEL} "
+        f"({'env: GEMINI_MODEL' if os.getenv('GEMINI_MODEL') else 'fallback default'})"
+    )
+    logger.info(
+        f"OpenRouter default model: {DEFAULT_OPENROUTER_MODEL} "
+        f"({'env: DEFAULT_OPENROUTER_MODEL' if os.getenv('DEFAULT_OPENROUTER_MODEL') else 'fallback default'})"
+    )
+    # Provider availability — booleans only, never key material or tokens.
+    logger.info(
+        f"Provider availability | gemini={'available' if GEMINI_API_KEY else 'NOT CONFIGURED'} | "
+        f"openrouter={'available' if OPENROUTER_API_KEY else 'NOT CONFIGURED'}"
+    )
     logger.info(f"Authentication configured: {bool(SECRET_TOKEN)}")
     validate_configuration()
     logger.info(f"Startup complete in {get_uptime_seconds():.2f}s")
