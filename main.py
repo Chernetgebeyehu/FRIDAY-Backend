@@ -26,6 +26,17 @@ import time
 import logging
 from dotenv import load_dotenv
 
+# Optional dependency: the official Anthropic SDK, used only by the Claude
+# fallback provider. Import is guarded so a deployment without the package
+# (or without ANTHROPIC_API_KEY) still boots — Claude is simply skipped in
+# the provider chain.
+try:
+    import anthropic
+    from anthropic import AsyncAnthropic
+    ANTHROPIC_SDK_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_SDK_AVAILABLE = False
+
 # ─── LOAD ENVIRONMENT VARIABLES ───────────────────────────────────────────────
 # This reads your .env file and puts the secrets into os.environ
 # Like opening your safe and putting the contents on your desk (privately)
@@ -33,6 +44,9 @@ load_dotenv()
 
 GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+# Optional providers in the automatic fallback chain (skipped when unset).
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
+ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
 SECRET_TOKEN       = os.getenv("SECRET_TOKEN", "")
 
 # CHANGE (fresh deployment): deployment-specific values now come from env vars
@@ -71,6 +85,50 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 DEFAULT_OPENROUTER_MODEL = os.getenv(
     "DEFAULT_OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it:free"
 )
+# Models for the optional chain providers — same rule: env-driven, modern
+# fallbacks, never pinned in code. claude-haiku-4-5 is the fastest/cheapest
+# current Claude model; gpt-5-mini is OpenAI's small current-generation model.
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5")
+
+# ─── PROVIDER FALLBACK CHAIN ──────────────────────────────────────────────────
+# FRIDAY is Gemini-first. When the active provider fails with a *transient*
+# class of error (timeout, 429, 5xx, unreachable, model unavailable), the
+# request automatically continues down the chain — the user never has to
+# press Send again, and the conversation history travels with the request,
+# so context is preserved across the switch.
+#
+# Order: gemini → openai → claude → openrouter.
+# openai/claude participate only when their API keys are configured.
+#
+# Recovery (requirement: switch back when Gemini returns): a failing provider
+# is put on a short cooldown instead of being disabled. Every request after
+# the cooldown expires starts at the top of the chain again, so Gemini
+# automatically becomes primary the moment it's healthy.
+PROVIDER_CHAIN = ["gemini", "openai", "claude", "openrouter"]
+PROVIDER_LABELS = {
+    "gemini": "Gemini",
+    "openai": "OpenAI",
+    "claude": "Claude",
+    "openrouter": "OpenRouter",
+}
+PROVIDER_COOLDOWN_SECONDS = float(os.getenv("PROVIDER_COOLDOWN_SECONDS", "120"))
+# Per-provider call timeout. Kept well under the Android app's 90s read
+# timeout so a chain that walks several providers still answers in time.
+PROVIDER_TIMEOUT_SECONDS = float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "20"))
+
+# provider name → monotonic timestamp until which it is skipped.
+_provider_cooldown_until: dict = {}
+
+
+def provider_configured(name: str) -> bool:
+    """A provider participates in the chain only when its key is set."""
+    return {
+        "gemini": bool(GEMINI_API_KEY),
+        "openai": bool(OPENAI_API_KEY),
+        "claude": bool(ANTHROPIC_API_KEY) and ANTHROPIC_SDK_AVAILABLE,
+        "openrouter": bool(OPENROUTER_API_KEY),
+    }.get(name, False)
 
 # Uptime tracking — monotonic clock so clock adjustments never skew uptime.
 _START_MONOTONIC = time.monotonic()
@@ -178,8 +236,11 @@ class ChatRequest(BaseModel):
     message: str                    # The user's text/voice input
     screen_context: Optional[str]   # Current screen content (for safety checks)
     model: Optional[str] = "gemini" # Which AI to use: "gemini" or "openrouter"
-    # None → server picks DEFAULT_OPENROUTER_MODEL (env-driven). Never hardcode
-    # a model ID here: providers delist models and a baked-in default rots.
+    # LEGACY (accepted, never required): older app builds send a provider-
+    # specific OpenRouter model ID here. The backend OWNS model selection now —
+    # this value is only used as a hint, and if the provider rejects it the
+    # backend automatically retries with DEFAULT_OPENROUTER_MODEL. New clients
+    # should omit it entirely.
     openrouter_model: Optional[str] = None
     history: Optional[list] = []    # Recent conversation turns
     token: str                      # Secret token - must match SECRET_TOKEN
@@ -193,8 +254,18 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     """What the server sends back to the Android app."""
     response: str    # The AI's JSON response (same format as before)
-    provider: str    # Which AI was used ("gemini" or "openrouter")
+    provider: str    # Which AI answered ("gemini"/"openai"/"claude"/"openrouter")
     latency_ms: int  # How long it took in milliseconds
+    # New, OPTIONAL fields — old app builds ignore unknown JSON keys, so
+    # adding these preserves Android compatibility.
+    # fallback_from: set when the preferred provider failed and the chain
+    # answered with another one (e.g. "gemini" when Claude had to step in).
+    fallback_from: Optional[str] = None
+    # Human-readable name of the provider that answered ("Gemini", "Claude").
+    provider_label: Optional[str] = None
+    # The exact model that produced this answer (backend-selected — the app
+    # never needs to know or send provider-specific model IDs).
+    model: Optional[str] = None
 
 class HealthResponse(BaseModel):
     """Status check response."""
@@ -227,6 +298,23 @@ def verify_token(request_token: str) -> bool:
     return request_token == SECRET_TOKEN
 
 # ─── AI PROVIDER FUNCTIONS ────────────────────────────────────────────────────
+
+class ProviderFailure(Exception):
+    """
+    A transient provider failure the fallback chain should absorb:
+    timeout, 429, 5xx, unreachable, or any upstream rejection (bad model,
+    bad key). The chain walker catches this, puts the provider on cooldown,
+    and tries the next provider — the user never has to press Send again.
+    Only when EVERY provider in the chain fails does it surface as an HTTP
+    error (via raise_provider_error).
+    """
+
+    def __init__(self, provider: str, upstream_status: int, message: str):
+        super().__init__(message)
+        self.provider = provider
+        self.upstream_status = upstream_status
+        self.message = message
+
 
 def raise_provider_error(provider: str, upstream_status: int, message: str):
     """
@@ -284,14 +372,14 @@ async def call_gemini(
 ) -> str:
     """
     Call Google's Gemini AI.
-    
+
     async means this function can pause while waiting for the network
     and let other requests be handled in the meantime.
     Like a waiter who takes 5 orders before going to the kitchen,
     instead of waiting for one order to be cooked before taking the next.
     """
     if not GEMINI_API_KEY:
-        raise HTTPException(status_code=500, detail="Gemini API key not configured")
+        raise ProviderFailure("gemini", 0, "Gemini API key not configured")
 
     # Build the message with optional screen context
     final_message = message
@@ -324,19 +412,29 @@ async def call_gemini(
 
     # Make the HTTP request to Gemini
     # httpx is like the fetch() in JavaScript — it makes HTTP requests
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(
-            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-            json=body,
-            headers={"Content-Type": "application/json"}
-        )
+    try:
+        async with httpx.AsyncClient(timeout=PROVIDER_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+                json=body,
+                headers={"Content-Type": "application/json"}
+            )
+    except (httpx.TimeoutException, httpx.TransportError) as e:
+        # Timeout / unreachable — a transient class the chain absorbs.
+        raise ProviderFailure("gemini", 0, f"network: {type(e).__name__}")
 
     if not response.is_success:
-        # NEVER re-raise the upstream status verbatim — translate it
-        # (see raise_provider_error for the incident this prevents).
+        # NEVER re-raise the upstream status verbatim — the chain walker
+        # translates it (see raise_provider_error for the incident this
+        # prevents) only after every provider has failed.
         error_data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
         error_msg = error_data.get("error", {}).get("message", f"Error {response.status_code}")
-        raise_provider_error("gemini", response.status_code, error_msg)
+        # Log the EXACT provider response body (truncated) for diagnosis.
+        logger.error(
+            f"Gemini raw response | model={GEMINI_MODEL} | "
+            f"status={response.status_code} | body={response.text[:500]}"
+        )
+        raise ProviderFailure("gemini", response.status_code, error_msg)
 
     # Parse the response
     data = response.json()
@@ -344,6 +442,123 @@ async def call_gemini(
         data["candidates"][0]["content"]["parts"][0]["text"]
         .strip()
     )
+    return strip_markdown(raw_text)
+
+
+def to_openai_messages(
+    message: str,
+    history: list,
+    screen_context: Optional[str] = None,
+) -> list:
+    """
+    Convert FRIDAY's Gemini-format history + new message into the OpenAI
+    message format shared by OpenAI, Claude (content shape), and OpenRouter.
+    History travels with every request, so the conversation is preserved
+    no matter which provider in the chain ends up answering.
+    """
+    final_message = message
+    if screen_context:
+        final_message = f"{message}\n\nScreen context:\n{screen_context[:1200]}"
+
+    messages = []
+    for turn in history[-20:]:
+        # Convert from Gemini format (model) to OpenAI format (assistant)
+        role = turn.get("role", "user")
+        if role == "model":
+            role = "assistant"
+        content = ""
+        parts = turn.get("parts", [])
+        if parts:
+            content = parts[0].get("text", "")
+        messages.append({"role": role, "content": content})
+
+    messages.append({"role": "user", "content": final_message})
+    return messages
+
+
+async def call_openai(
+    message: str,
+    history: list,
+    screen_context: Optional[str] = None
+) -> str:
+    """
+    Call OpenAI's Chat Completions API. Optional chain member — only used
+    when OPENAI_API_KEY is configured. Same JSON-only contract as the
+    other providers, so ActionRouter on Android parses it identically.
+    """
+    if not OPENAI_API_KEY:
+        raise ProviderFailure("openai", 0, "OpenAI API key not configured")
+
+    messages = [{"role": "system", "content": FRIDAY_SYSTEM_PROMPT}]
+    messages += to_openai_messages(message, history, screen_context)
+
+    try:
+        async with httpx.AsyncClient(timeout=PROVIDER_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                json={
+                    "model": OPENAI_MODEL,
+                    "messages": messages,
+                    "max_completion_tokens": 600,
+                    "response_format": {"type": "json_object"},
+                },
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+    except (httpx.TimeoutException, httpx.TransportError) as e:
+        raise ProviderFailure("openai", 0, f"network: {type(e).__name__}")
+
+    if not response.is_success:
+        raise ProviderFailure("openai", response.status_code, response.text[:200])
+
+    data = response.json()
+    raw_text = data["choices"][0]["message"]["content"].strip()
+    return strip_markdown(raw_text)
+
+
+async def call_claude(
+    message: str,
+    history: list,
+    screen_context: Optional[str] = None
+) -> str:
+    """
+    Call Anthropic's Claude via the official SDK (Messages API). Optional
+    chain member — only used when ANTHROPIC_API_KEY is configured and the
+    `anthropic` package is installed.
+    """
+    if not (ANTHROPIC_API_KEY and ANTHROPIC_SDK_AVAILABLE):
+        raise ProviderFailure("claude", 0, "Claude not configured")
+
+    # max_retries=0: retry/fallback policy belongs to OUR chain walker,
+    # not the SDK. timeout keeps the whole chain under the app's 90s budget.
+    client = AsyncAnthropic(
+        api_key=ANTHROPIC_API_KEY,
+        timeout=PROVIDER_TIMEOUT_SECONDS,
+        max_retries=0,
+    )
+    try:
+        response = await client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=600,
+            system=FRIDAY_SYSTEM_PROMPT,
+            messages=to_openai_messages(message, history, screen_context),
+        )
+    except anthropic.RateLimitError as e:
+        raise ProviderFailure("claude", 429, str(e)[:200])
+    except anthropic.APIStatusError as e:
+        raise ProviderFailure("claude", e.status_code, str(e)[:200])
+    except (anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
+        raise ProviderFailure("claude", 0, f"network: {type(e).__name__}")
+    finally:
+        await client.close()
+
+    raw_text = next(
+        (block.text for block in response.content if block.type == "text"), ""
+    ).strip()
+    if not raw_text:
+        raise ProviderFailure("claude", 0, "empty response")
     return strip_markdown(raw_text)
 
 
@@ -359,27 +574,11 @@ async def call_openrouter(
     hundreds of AI models from one place.
     """
     if not OPENROUTER_API_KEY:
-        raise HTTPException(status_code=500, detail="OpenRouter API key not configured")
-
-    final_message = message
-    if screen_context:
-        final_message = f"{message}\n\nScreen context:\n{screen_context[:1200]}"
+        raise ProviderFailure("openrouter", 0, "OpenRouter API key not configured")
 
     # OpenRouter uses OpenAI's message format (role: user/assistant/system)
     messages = [{"role": "system", "content": FRIDAY_SYSTEM_PROMPT}]
-
-    for turn in history[-20:]:
-        # Convert from Gemini format (model) to OpenRouter format (assistant)
-        role = turn.get("role", "user")
-        if role == "model":
-            role = "assistant"
-        content = ""
-        parts = turn.get("parts", [])
-        if parts:
-            content = parts[0].get("text", "")
-        messages.append({"role": role, "content": content})
-
-    messages.append({"role": "user", "content": final_message})
+    messages += to_openai_messages(message, history, screen_context)
 
     body = {
         "model": model,
@@ -389,29 +588,181 @@ async def call_openrouter(
         "response_format": {"type": "json_object"}
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(
-            OPENROUTER_URL,
-            json=body,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                # CHANGE: previously hardcoded to an old domain; now env-configurable
-                "HTTP-Referer": APP_REFERER,
-                "X-Title": APP_TITLE
-            }
-        )
+    try:
+        async with httpx.AsyncClient(timeout=PROVIDER_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                OPENROUTER_URL,
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    # CHANGE: previously hardcoded to an old domain; now env-configurable
+                    "HTTP-Referer": APP_REFERER,
+                    "X-Title": APP_TITLE
+                }
+            )
+    except (httpx.TimeoutException, httpx.TransportError) as e:
+        raise ProviderFailure("openrouter", 0, f"network: {type(e).__name__}")
 
     if not response.is_success:
-        # NEVER re-raise the upstream status verbatim — translate it
-        # (see raise_provider_error for the incident this prevents).
-        raise_provider_error(
-            "openrouter", response.status_code, response.text[:200]
+        # NEVER re-raise the upstream status verbatim — the chain walker
+        # translates it only after every provider has failed.
+        # Log the EXACT provider response body so a model rejection is never
+        # ambiguous in the logs again (this is what diagnosed the 2026-08-01
+        # incident and its regression).
+        logger.error(
+            f"OpenRouter raw response | model={model} | "
+            f"status={response.status_code} | body={response.text[:500]}"
         )
+        raise ProviderFailure("openrouter", response.status_code, response.text[:200])
 
     data = response.json()
     raw_text = data["choices"][0]["message"]["content"].strip()
     return strip_markdown(raw_text)
+
+
+# ─── PROVIDER FALLBACK CHAIN WALKER ──────────────────────────────────────────
+
+def model_for_provider(name: str, requested_openrouter_model: Optional[str]) -> str:
+    """
+    THE BACKEND OWNS MODEL SELECTION. The Android app only ever names a
+    provider ("gemini"/"openrouter") — never a provider-specific model ID.
+    Each provider resolves to its backend-configured production model:
+      gemini     → GEMINI_MODEL           (env, fallback rolling alias)
+      openai     → OPENAI_MODEL           (env)
+      claude     → CLAUDE_MODEL           (env)
+      openrouter → requested hint if a legacy client sent one, else
+                   DEFAULT_OPENROUTER_MODEL (env). A rejected hint is
+                   retried with the default automatically (see
+                   call_provider) before the provider is marked failed.
+    """
+    return {
+        "gemini": GEMINI_MODEL,
+        "openai": OPENAI_MODEL,
+        "claude": CLAUDE_MODEL,
+        "openrouter": requested_openrouter_model or DEFAULT_OPENROUTER_MODEL,
+    }.get(name, "")
+
+
+async def call_provider(
+    name: str,
+    message: str,
+    history: list,
+    screen_context: Optional[str],
+    openrouter_model: Optional[str],
+) -> tuple:
+    """
+    Dispatch one chain member by name. Returns (text, final_model).
+
+    Model-level fallback (openrouter): if a legacy client sent a model hint
+    and OpenRouter rejects it with a 4xx (delisted/invalid model), the SAME
+    provider is retried once with the backend's configured default model
+    before the failure is allowed to bubble to the chain walker. This makes
+    stale model IDs baked into old app builds harmless.
+    """
+    if name == "gemini":
+        return await call_gemini(message, history, screen_context), GEMINI_MODEL
+    if name == "openai":
+        return await call_openai(message, history, screen_context), OPENAI_MODEL
+    if name == "claude":
+        return await call_claude(message, history, screen_context), CLAUDE_MODEL
+    if name == "openrouter":
+        model = openrouter_model or DEFAULT_OPENROUTER_MODEL
+        try:
+            return await call_openrouter(message, history, model, screen_context), model
+        except ProviderFailure as e:
+            retriable = (
+                model != DEFAULT_OPENROUTER_MODEL
+                and 400 <= e.upstream_status < 500
+                and e.upstream_status != 429
+            )
+            if not retriable:
+                raise
+            logger.warning(
+                f"Model fallback | provider=openrouter | "
+                f"rejected_model={model} (upstream {e.upstream_status}) | "
+                f"retrying with default={DEFAULT_OPENROUTER_MODEL}"
+            )
+            return (
+                await call_openrouter(
+                    message, history, DEFAULT_OPENROUTER_MODEL, screen_context
+                ),
+                DEFAULT_OPENROUTER_MODEL,
+            )
+    raise ProviderFailure(name, 0, f"unknown provider {name}")
+
+
+async def call_with_fallback(
+    preferred: str,
+    message: str,
+    history: list,
+    screen_context: Optional[str],
+    openrouter_model: Optional[str],
+) -> tuple:
+    """
+    Walk the provider chain starting from [preferred], falling through to
+    the remaining chain members on any transient failure (timeout, 429,
+    5xx, unreachable, upstream rejection). Returns
+    (ai_response, provider_used, final_model, fallback_from) where
+    fallback_from is the provider the user asked for, or None if it
+    answered directly.
+
+    Recovery is automatic: failures only set a short cooldown (never a
+    permanent flag), and every request re-evaluates the chain from the
+    top — so the moment Gemini's cooldown lapses and it answers again,
+    it is primary again. No restart, no user action.
+    """
+    # Preferred provider first, then the rest of the chain in order.
+    ordered = [preferred] + [p for p in PROVIDER_CHAIN if p != preferred]
+    candidates = [p for p in ordered if provider_configured(p)]
+    if not candidates:
+        raise_provider_error("none", 0, "No AI provider configured")
+
+    now = time.monotonic()
+    ready = [p for p in candidates if _provider_cooldown_until.get(p, 0) <= now]
+    # If literally everything is cooling down, try them all anyway rather
+    # than failing a request while a provider might have recovered.
+    attempt_order = ready or candidates
+
+    # SELECTION TRACE — one line answers "who was asked, who fell back, who
+    # answered, with which model" for every request.
+    logger.info(
+        f"Provider selection | requested_provider={preferred} | "
+        f"requested_model={model_for_provider(preferred, openrouter_model)} | "
+        f"attempt_order={attempt_order}"
+    )
+
+    last_failure: Optional[ProviderFailure] = None
+    for name in attempt_order:
+        try:
+            text, final_model = await call_provider(
+                name, message, history, screen_context, openrouter_model
+            )
+            # Success clears the cooldown so this provider is instantly
+            # trusted again (requirement: auto-switch back to Gemini).
+            _provider_cooldown_until.pop(name, None)
+            fallback_from = preferred if name != preferred else None
+            logger.info(
+                f"Provider selection | final_provider={name} | "
+                f"final_model={final_model} | "
+                f"fallback_from={fallback_from or 'none'}"
+            )
+            return text, name, final_model, fallback_from
+        except ProviderFailure as e:
+            last_failure = e
+            _provider_cooldown_until[name] = (
+                time.monotonic() + PROVIDER_COOLDOWN_SECONDS
+            )
+            logger.warning(
+                f"Provider failed, trying next in chain | provider={e.provider} | "
+                f"fallback_model={model_for_provider(e.provider, openrouter_model)} | "
+                f"upstream_status={e.upstream_status} | {e.message[:200]}"
+            )
+
+    # Whole chain exhausted — now (and only now) surface a translated error.
+    raise_provider_error(
+        last_failure.provider, last_failure.upstream_status, last_failure.message
+    )
 
 
 def strip_markdown(text: str) -> str:
@@ -509,8 +860,12 @@ async def health():
         "uptime_human": format_uptime(get_uptime_seconds()),
         "providers": {
             "gemini": "configured" if GEMINI_API_KEY else "not_configured",
+            "openai": "configured" if provider_configured("openai") else "not_configured",
+            "claude": "configured" if provider_configured("claude") else "not_configured",
             "openrouter": "configured" if OPENROUTER_API_KEY else "not_configured",
         },
+        # Chain order actually in effect (configured providers only).
+        "provider_chain": [p for p in PROVIDER_CHAIN if provider_configured(p)],
         "auth": "configured" if SECRET_TOKEN else "not_configured",
         # Railway sets RAILWAY_ENVIRONMENT (e.g. "production"); safe to expose.
         "environment": os.getenv("RAILWAY_ENVIRONMENT", "local"),
@@ -530,6 +885,8 @@ async def providers():
     """
     return {
         "gemini": bool(GEMINI_API_KEY),
+        "openai": provider_configured("openai"),
+        "claude": provider_configured("claude"),
         "openrouter": bool(OPENROUTER_API_KEY),
     }
 
@@ -563,43 +920,42 @@ async def chat(request: ChatRequest):
 
     start_time = time.time()
 
-    # Step 3: Route to the right AI
-    try:
-        if request.model == "gemini":
-            ai_response = await call_gemini(
-                message=request.message,
-                history=request.history or [],
-                screen_context=request.screen_context
-            )
-            provider = "gemini"
+    # Step 3: Walk the provider chain. `request.model` picks the STARTING
+    # provider (default "gemini" — FRIDAY is Gemini-first); on transient
+    # failure the chain continues automatically (gemini → openai → claude
+    # → openrouter, skipping unconfigured providers), carrying the full
+    # conversation history so context survives the switch. Unknown values
+    # (from older/newer apps) also start at the top of the chain instead
+    # of failing — keeps Android compatibility as clients evolve.
+    preferred = request.model if request.model in PROVIDER_CHAIN else PROVIDER_CHAIN[0]
 
-        elif request.model == "openrouter":
-            ai_response = await call_openrouter(
-                message=request.message,
-                history=request.history or [],
-                model=request.openrouter_model or DEFAULT_OPENROUTER_MODEL,
-                screen_context=request.screen_context
-            )
-            provider = "openrouter"
-
-        else:
-            raise HTTPException(status_code=400, detail=f"Unknown model: {request.model}")
-
-    except HTTPException:
-        raise  # Re-raise HTTP exceptions as-is
-
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-        ai_response = build_error_response(f"Server error: {str(e)[:100]}")
-        provider = "error"
+    ai_response, provider, final_model, fallback_from = await call_with_fallback(
+        preferred=preferred,
+        message=request.message,
+        history=request.history or [],
+        screen_context=request.screen_context,
+        openrouter_model=request.openrouter_model,
+    )
 
     latency = int((time.time() - start_time) * 1000)
-    logger.info(f"Response sent | provider={provider} | latency={latency}ms")
+    if fallback_from:
+        logger.info(
+            f"Response sent | provider={provider} | model={final_model} | "
+            f"(fallback from {fallback_from}) | latency={latency}ms"
+        )
+    else:
+        logger.info(
+            f"Response sent | provider={provider} | model={final_model} | "
+            f"latency={latency}ms"
+        )
 
     return ChatResponse(
         response=ai_response,
         provider=provider,
-        latency_ms=latency
+        latency_ms=latency,
+        fallback_from=fallback_from,
+        provider_label=PROVIDER_LABELS.get(provider, provider),
+        model=final_model,
     )
 
 
@@ -688,15 +1044,17 @@ def validate_configuration():
             "SECRET_TOKEN is not set — ALL /chat requests will be rejected (fail-closed). "
             "Set it in Railway's Variables tab."
         )
-    if not GEMINI_API_KEY and not OPENROUTER_API_KEY:
+    configured = [p for p in PROVIDER_CHAIN if provider_configured(p)]
+    if not configured:
         problems.append(
-            "No AI provider configured (GEMINI_API_KEY and OPENROUTER_API_KEY both missing) — "
+            "No AI provider configured (no provider API key set) — "
             "/chat will return errors for every request."
         )
-    elif not GEMINI_API_KEY:
-        problems.append("GEMINI_API_KEY not set — gemini requests will fail.")
-    elif not OPENROUTER_API_KEY:
-        problems.append("OPENROUTER_API_KEY not set — openrouter requests will fail.")
+    elif not provider_configured("gemini"):
+        problems.append(
+            "GEMINI_API_KEY not set — FRIDAY is Gemini-first, so every request "
+            f"will start at the first fallback ({configured[0]})."
+        )
 
     for p in problems:
         logger.warning(f"CONFIG: {p}")
@@ -720,10 +1078,21 @@ async def startup():
         f"OpenRouter default model: {DEFAULT_OPENROUTER_MODEL} "
         f"({'env: DEFAULT_OPENROUTER_MODEL' if os.getenv('DEFAULT_OPENROUTER_MODEL') else 'fallback default'})"
     )
+    if provider_configured("openai"):
+        logger.info(f"OpenAI model: {OPENAI_MODEL}")
+    if provider_configured("claude"):
+        logger.info(f"Claude model: {CLAUDE_MODEL}")
     # Provider availability — booleans only, never key material or tokens.
     logger.info(
-        f"Provider availability | gemini={'available' if GEMINI_API_KEY else 'NOT CONFIGURED'} | "
-        f"openrouter={'available' if OPENROUTER_API_KEY else 'NOT CONFIGURED'}"
+        "Provider availability | "
+        + " | ".join(
+            f"{p}={'available' if provider_configured(p) else 'NOT CONFIGURED'}"
+            for p in PROVIDER_CHAIN
+        )
+    )
+    logger.info(
+        "Fallback chain (in effect): "
+        + (" → ".join(p for p in PROVIDER_CHAIN if provider_configured(p)) or "NONE")
     )
     logger.info(f"Authentication configured: {bool(SECRET_TOKEN)}")
     validate_configuration()
