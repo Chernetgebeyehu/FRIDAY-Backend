@@ -61,7 +61,10 @@ APP_TITLE   = os.getenv("APP_TITLE", "FRIDAY AI Assistant")
 
 # CHANGE (production upgrade): single source of truth for the app version.
 # Set APP_VERSION on Railway to change the reported version without a deploy.
-APP_VERSION  = os.getenv("APP_VERSION", "1.0.0")
+# The default is bumped on every code change so /version fingerprints which
+# build Railway is actually serving (the 2026-08-04 incident was a stale
+# deployment that was indistinguishable from current code until probed).
+APP_VERSION  = os.getenv("APP_VERSION", "2.1.0")
 SERVICE_NAME = "FRIDAY Backend"
 
 # ─── AI MODEL SELECTION (env-driven — NEVER hardcode model IDs) ───────────────
@@ -82,6 +85,11 @@ SERVICE_NAME = "FRIDAY Backend"
 # DEFAULT_OPENROUTER_MODEL: used when the Android app doesn't specify one.
 # Fallback verified live in OpenRouter's catalog (2026-08-01).
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+# Model-level fallback for Gemini: if the env-configured model is rejected
+# upstream (typo in a Railway variable, or a pinned snapshot Google retired),
+# the same request is retried once with this rolling alias — Google keeps it
+# pointed at the current flash model, so it cannot rot.
+GEMINI_FALLBACK_MODEL = "gemini-flash-latest"
 DEFAULT_OPENROUTER_MODEL = os.getenv(
     "DEFAULT_OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it:free"
 )
@@ -175,10 +183,7 @@ app.add_middleware(
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
 # GEMINI_MODEL / DEFAULT_OPENROUTER_MODEL are env-driven (see AI MODEL
 # SELECTION above) — only the provider base URLs are true constants.
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent"
-)
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
@@ -316,7 +321,12 @@ class ProviderFailure(Exception):
         self.message = message
 
 
-def raise_provider_error(provider: str, upstream_status: int, message: str):
+def raise_provider_error(
+    provider: str,
+    upstream_status: int,
+    message: str,
+    attempts: Optional[list] = None,
+):
     """
     Translate an upstream AI-provider HTTP status into the status WE return.
 
@@ -341,7 +351,10 @@ def raise_provider_error(provider: str, upstream_status: int, message: str):
 
     The body is structured JSON (FastAPI wraps it as {"detail": {...}}) so
     logs and clients can see exactly which provider failed and why, without
-    ambiguity about whose status code they're looking at.
+    ambiguity about whose status code they're looking at. This error is only
+    raised after EVERY provider and model fallback has been exhausted, so
+    `attempts` (when given) lists each provider+model tried and why it
+    failed — the actual problem, not a generic "model configuration" guess.
     """
     if upstream_status == 429:
         ours = 429
@@ -354,24 +367,34 @@ def raise_provider_error(provider: str, upstream_status: int, message: str):
         f"Provider error | provider={provider} | "
         f"upstream_status={upstream_status} | returned={ours} | {message[:200]}"
     )
-    raise HTTPException(
-        status_code=ours,
-        detail={
-            "error": "upstream_provider_error",
-            "provider": provider,
-            "provider_status": upstream_status,
-            "message": message[:300],
-        },
-    )
+    detail = {
+        "error": "all_providers_failed" if attempts else "upstream_provider_error",
+        "provider": provider,
+        "provider_status": upstream_status,
+        "message": message[:300],
+    }
+    if attempts:
+        detail["attempts"] = attempts
+        tried = ", ".join(
+            f"{a['provider']} ({a['model']}): {a['reason']}" for a in attempts
+        )
+        detail["message"] = (
+            f"Every configured AI provider failed. Tried: {tried}"
+        )[:600]
+    raise HTTPException(status_code=ours, detail=detail)
 
 
 async def call_gemini(
     message: str,
     history: list,
-    screen_context: Optional[str] = None
+    screen_context: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> str:
     """
     Call Google's Gemini AI.
+
+    `model` defaults to the env-configured GEMINI_MODEL; call_provider passes
+    GEMINI_FALLBACK_MODEL on the model-level retry.
 
     async means this function can pause while waiting for the network
     and let other requests be handled in the meantime.
@@ -380,6 +403,7 @@ async def call_gemini(
     """
     if not GEMINI_API_KEY:
         raise ProviderFailure("gemini", 0, "Gemini API key not configured")
+    model = model or GEMINI_MODEL
 
     # Build the message with optional screen context
     final_message = message
@@ -415,7 +439,7 @@ async def call_gemini(
     try:
         async with httpx.AsyncClient(timeout=PROVIDER_TIMEOUT_SECONDS) as client:
             response = await client.post(
-                f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+                f"{GEMINI_BASE_URL}/{model}:generateContent?key={GEMINI_API_KEY}",
                 json=body,
                 headers={"Content-Type": "application/json"}
             )
@@ -431,7 +455,7 @@ async def call_gemini(
         error_msg = error_data.get("error", {}).get("message", f"Error {response.status_code}")
         # Log the EXACT provider response body (truncated) for diagnosis.
         logger.error(
-            f"Gemini raw response | model={GEMINI_MODEL} | "
+            f"Gemini raw response | model={model} | "
             f"status={response.status_code} | body={response.text[:500]}"
         )
         raise ProviderFailure("gemini", response.status_code, error_msg)
@@ -654,14 +678,42 @@ async def call_provider(
     """
     Dispatch one chain member by name. Returns (text, final_model).
 
-    Model-level fallback (openrouter): if a legacy client sent a model hint
-    and OpenRouter rejects it with a 4xx (delisted/invalid model), the SAME
-    provider is retried once with the backend's configured default model
-    before the failure is allowed to bubble to the chain walker. This makes
-    stale model IDs baked into old app builds harmless.
+    Model-level fallback happens HERE, inside a single chain slot, before a
+    provider is allowed to fail:
+      gemini: if the env-configured GEMINI_MODEL is rejected with a 4xx
+        (typo'd Railway variable, retired snapshot), the SAME provider is
+        retried once with GEMINI_FALLBACK_MODEL (rolling alias, cannot rot).
+      openrouter: if a legacy client sent a model hint and OpenRouter rejects
+        it with a 4xx (delisted/invalid model), retried once with the
+        backend's configured DEFAULT_OPENROUTER_MODEL. This makes stale model
+        IDs baked into old app builds harmless.
     """
     if name == "gemini":
-        return await call_gemini(message, history, screen_context), GEMINI_MODEL
+        try:
+            return (
+                await call_gemini(message, history, screen_context),
+                GEMINI_MODEL,
+            )
+        except ProviderFailure as e:
+            retriable = (
+                GEMINI_MODEL != GEMINI_FALLBACK_MODEL
+                and 400 <= e.upstream_status < 500
+                and e.upstream_status != 429
+            )
+            if not retriable:
+                raise
+            logger.warning(
+                f"Model fallback | provider=gemini | "
+                f"rejected_model={GEMINI_MODEL} (upstream {e.upstream_status}) | "
+                f"retrying with fallback={GEMINI_FALLBACK_MODEL}"
+            )
+            return (
+                await call_gemini(
+                    message, history, screen_context,
+                    model=GEMINI_FALLBACK_MODEL,
+                ),
+                GEMINI_FALLBACK_MODEL,
+            )
     if name == "openai":
         return await call_openai(message, history, screen_context), OPENAI_MODEL
     if name == "claude":
@@ -733,6 +785,7 @@ async def call_with_fallback(
     )
 
     last_failure: Optional[ProviderFailure] = None
+    attempts: list = []  # every provider+model tried, for the final error body
     for name in attempt_order:
         try:
             text, final_model = await call_provider(
@@ -750,6 +803,12 @@ async def call_with_fallback(
             return text, name, final_model, fallback_from
         except ProviderFailure as e:
             last_failure = e
+            attempts.append({
+                "provider": e.provider,
+                "model": model_for_provider(e.provider, openrouter_model),
+                "upstream_status": e.upstream_status,
+                "reason": e.message[:160],
+            })
             _provider_cooldown_until[name] = (
                 time.monotonic() + PROVIDER_COOLDOWN_SECONDS
             )
@@ -759,9 +818,13 @@ async def call_with_fallback(
                 f"upstream_status={e.upstream_status} | {e.message[:200]}"
             )
 
-    # Whole chain exhausted — now (and only now) surface a translated error.
+    # Whole chain exhausted — now (and only now) surface a translated error
+    # that names every provider+model tried and each upstream reason.
     raise_provider_error(
-        last_failure.provider, last_failure.upstream_status, last_failure.message
+        last_failure.provider,
+        last_failure.upstream_status,
+        last_failure.message,
+        attempts=attempts,
     )
 
 
