@@ -64,7 +64,7 @@ APP_TITLE   = os.getenv("APP_TITLE", "FRIDAY AI Assistant")
 # The default is bumped on every code change so /version fingerprints which
 # build Railway is actually serving (the 2026-08-04 incident was a stale
 # deployment that was indistinguishable from current code until probed).
-APP_VERSION  = os.getenv("APP_VERSION", "2.1.0")
+APP_VERSION  = os.getenv("APP_VERSION", "2.2.0")
 SERVICE_NAME = "FRIDAY Backend"
 
 # ─── AI MODEL SELECTION (env-driven — NEVER hardcode model IDs) ───────────────
@@ -240,6 +240,12 @@ class ChatRequest(BaseModel):
     """What the Android app sends to the server."""
     message: str                    # The user's text/voice input
     screen_context: Optional[str]   # Current screen content (for safety checks)
+    # NEW (2.2.0 — screen vision): optional JPEG screenshot, base64-encoded
+    # (no data-URI prefix). Given to Gemini as a multimodal part so FRIDAY can
+    # SEE the screen, not just read its accessibility text. Other providers
+    # ignore the image (a text note is appended instead) so the fallback
+    # chain keeps working. MUST default to None — older app builds omit it.
+    image_base64: Optional[str] = None
     model: Optional[str] = "gemini" # Which AI to use: "gemini" or "openrouter"
     # LEGACY (accepted, never required): older app builds send a provider-
     # specific OpenRouter model ID here. The backend OWNS model selection now —
@@ -389,12 +395,16 @@ async def call_gemini(
     history: list,
     screen_context: Optional[str] = None,
     model: Optional[str] = None,
+    image_base64: Optional[str] = None,
 ) -> str:
     """
     Call Google's Gemini AI.
 
     `model` defaults to the env-configured GEMINI_MODEL; call_provider passes
     GEMINI_FALLBACK_MODEL on the model-level retry.
+
+    `image_base64` (2.2.0): when present, sent as an inline_data JPEG part so
+    Gemini answers from the actual pixels of the user's screen.
 
     async means this function can pause while waiting for the network
     and let other requests be handled in the meantime.
@@ -415,10 +425,20 @@ async def call_gemini(
     for turn in history[-20:]:  # Max 10 turns (20 = user+model pairs)
         contents.append(turn)
 
-    # Add the new user message
+    # Add the new user message — multimodal when a screenshot came along.
+    # Image first, then text: Gemini reads media-then-question best.
+    user_parts = []
+    if image_base64:
+        user_parts.append({
+            "inline_data": {
+                "mime_type": "image/jpeg",
+                "data": image_base64,
+            }
+        })
+    user_parts.append({"text": final_message})
     contents.append({
         "role": "user",
-        "parts": [{"text": final_message}]
+        "parts": user_parts
     })
 
     # Build the full request body
@@ -473,16 +493,26 @@ def to_openai_messages(
     message: str,
     history: list,
     screen_context: Optional[str] = None,
+    has_image: bool = False,
 ) -> list:
     """
     Convert FRIDAY's Gemini-format history + new message into the OpenAI
     message format shared by OpenAI, Claude (content shape), and OpenRouter.
     History travels with every request, so the conversation is preserved
     no matter which provider in the chain ends up answering.
+
+    has_image (2.2.0): these providers don't receive the screenshot — a text
+    note tells the model an image existed so it can answer honestly from the
+    accessibility text instead of hallucinating pixels.
     """
     final_message = message
     if screen_context:
         final_message = f"{message}\n\nScreen context:\n{screen_context[:1200]}"
+    if has_image:
+        final_message += (
+            "\n\n(Note: the user attached a screenshot, but this model only "
+            "receives the text above — answer from the text context.)"
+        )
 
     messages = []
     for turn in history[-20:]:
@@ -503,7 +533,8 @@ def to_openai_messages(
 async def call_openai(
     message: str,
     history: list,
-    screen_context: Optional[str] = None
+    screen_context: Optional[str] = None,
+    has_image: bool = False,
 ) -> str:
     """
     Call OpenAI's Chat Completions API. Optional chain member — only used
@@ -514,7 +545,7 @@ async def call_openai(
         raise ProviderFailure("openai", 0, "OpenAI API key not configured")
 
     messages = [{"role": "system", "content": FRIDAY_SYSTEM_PROMPT}]
-    messages += to_openai_messages(message, history, screen_context)
+    messages += to_openai_messages(message, history, screen_context, has_image)
 
     try:
         async with httpx.AsyncClient(timeout=PROVIDER_TIMEOUT_SECONDS) as client:
@@ -545,7 +576,8 @@ async def call_openai(
 async def call_claude(
     message: str,
     history: list,
-    screen_context: Optional[str] = None
+    screen_context: Optional[str] = None,
+    has_image: bool = False,
 ) -> str:
     """
     Call Anthropic's Claude via the official SDK (Messages API). Optional
@@ -567,7 +599,7 @@ async def call_claude(
             model=CLAUDE_MODEL,
             max_tokens=600,
             system=FRIDAY_SYSTEM_PROMPT,
-            messages=to_openai_messages(message, history, screen_context),
+            messages=to_openai_messages(message, history, screen_context, has_image),
         )
     except anthropic.RateLimitError as e:
         raise ProviderFailure("claude", 429, str(e)[:200])
@@ -590,7 +622,8 @@ async def call_openrouter(
     message: str,
     history: list,
     model: str,
-    screen_context: Optional[str] = None
+    screen_context: Optional[str] = None,
+    has_image: bool = False,
 ) -> str:
     """
     Call OpenRouter — a service that gives access to many AI models
@@ -602,7 +635,7 @@ async def call_openrouter(
 
     # OpenRouter uses OpenAI's message format (role: user/assistant/system)
     messages = [{"role": "system", "content": FRIDAY_SYSTEM_PROMPT}]
-    messages += to_openai_messages(message, history, screen_context)
+    messages += to_openai_messages(message, history, screen_context, has_image)
 
     body = {
         "model": model,
@@ -674,9 +707,13 @@ async def call_provider(
     history: list,
     screen_context: Optional[str],
     openrouter_model: Optional[str],
+    image_base64: Optional[str] = None,
 ) -> tuple:
     """
     Dispatch one chain member by name. Returns (text, final_model).
+
+    Only Gemini receives the actual image (2.2.0); the other providers get a
+    text note so a chain fallback still answers sensibly.
 
     Model-level fallback happens HERE, inside a single chain slot, before a
     provider is allowed to fail:
@@ -688,10 +725,14 @@ async def call_provider(
         backend's configured DEFAULT_OPENROUTER_MODEL. This makes stale model
         IDs baked into old app builds harmless.
     """
+    has_image = bool(image_base64)
     if name == "gemini":
         try:
             return (
-                await call_gemini(message, history, screen_context),
+                await call_gemini(
+                    message, history, screen_context,
+                    image_base64=image_base64,
+                ),
                 GEMINI_MODEL,
             )
         except ProviderFailure as e:
@@ -711,17 +752,18 @@ async def call_provider(
                 await call_gemini(
                     message, history, screen_context,
                     model=GEMINI_FALLBACK_MODEL,
+                    image_base64=image_base64,
                 ),
                 GEMINI_FALLBACK_MODEL,
             )
     if name == "openai":
-        return await call_openai(message, history, screen_context), OPENAI_MODEL
+        return await call_openai(message, history, screen_context, has_image), OPENAI_MODEL
     if name == "claude":
-        return await call_claude(message, history, screen_context), CLAUDE_MODEL
+        return await call_claude(message, history, screen_context, has_image), CLAUDE_MODEL
     if name == "openrouter":
         model = openrouter_model or DEFAULT_OPENROUTER_MODEL
         try:
-            return await call_openrouter(message, history, model, screen_context), model
+            return await call_openrouter(message, history, model, screen_context, has_image), model
         except ProviderFailure as e:
             retriable = (
                 model != DEFAULT_OPENROUTER_MODEL
@@ -737,7 +779,7 @@ async def call_provider(
             )
             return (
                 await call_openrouter(
-                    message, history, DEFAULT_OPENROUTER_MODEL, screen_context
+                    message, history, DEFAULT_OPENROUTER_MODEL, screen_context, has_image
                 ),
                 DEFAULT_OPENROUTER_MODEL,
             )
@@ -750,6 +792,7 @@ async def call_with_fallback(
     history: list,
     screen_context: Optional[str],
     openrouter_model: Optional[str],
+    image_base64: Optional[str] = None,
 ) -> tuple:
     """
     Walk the provider chain starting from [preferred], falling through to
@@ -789,7 +832,8 @@ async def call_with_fallback(
     for name in attempt_order:
         try:
             text, final_model = await call_provider(
-                name, message, history, screen_context, openrouter_model
+                name, message, history, screen_context, openrouter_model,
+                image_base64,
             )
             # Success clears the cooldown so this provider is instantly
             # trusted again (requirement: auto-switch back to Gemini).
@@ -974,11 +1018,12 @@ async def chat(request: ChatRequest):
         logger.warning("Unauthorized request — wrong token")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Step 2: Log the request (never log the full message for privacy)
+    # Step 2: Log the request (never log the full message OR the image bytes)
     logger.info(
         f"Chat request | provider={request.model} | "
         f"msg_length={len(request.message)} | "
-        f"has_screen={bool(request.screen_context)}"
+        f"has_screen={bool(request.screen_context)} | "
+        f"has_image={bool(request.image_base64)}"
     )
 
     start_time = time.time()
@@ -998,6 +1043,7 @@ async def chat(request: ChatRequest):
         history=request.history or [],
         screen_context=request.screen_context,
         openrouter_model=request.openrouter_model,
+        image_base64=request.image_base64,
     )
 
     latency = int((time.time() - start_time) * 1000)
